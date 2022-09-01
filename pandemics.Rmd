@@ -1,0 +1,166 @@
+---
+title: "Preprints and Pandemics Figures"
+output:
+  pdf_document: default
+  html_notebook: default
+params:
+  doc_refresh_data:
+    value: no
+    choices:
+    - yes
+    - no
+---
+
+
+# 2010-2022 Submissions per month
+# Biorxiv
+# Arxiv
+# MedRxviv
+# OSF 
+# SSRN
+
+```{r setup}
+library("tidyverse")
+library("magrittr")
+library(knitr)
+doc_refresh_data <- params$doc_refresh_data
+```
+```{r retrieve-medrxiv}
+if (doc_refresh_data) {
+   mx_data.tbl <- medrxivr::mx_api_content(server="medrxiv")
+  saveRDS(mx_data.tbl,file='mx_data.tbl.RDS')
+}
+mx_data.tbl <- readRDS("mx_data.tbl.RDS")
+```
+```{r retrieve-biorxiv}
+if (doc_refresh_data) {
+   bx_data.tbl <- medrxivr::mx_api_content(server="biorxiv")
+   saveRDS(bx_data.tbl,file="bx_data.tbl.RDS")
+}
+bx_data.tbl <- readRDS("bx_data.tbl.RDS")
+```
+```{r retrieve-arxiv-monthly}
+if (doc_refresh_data) {
+   ax_monthly_data.tbl <- 
+     read_csv("https://arxiv.org/stats/get_monthly_submissions")
+   saveRDS(ax_monthly_data.tbl,file="ax_monthly_data.tbl.RDS")
+}
+ax_monthly_data.tbl <- readRDS("ax_monthly_data.tbl.RDS")
+```
+```{r retrieve-rsqr}
+if (doc_refresh_data) {
+  library("oaind")
+  rsqr.src <-etl.oaind(src="rsqr") 
+  rsqr.src %>%   
+    etl::etl_extract(progress=TRUE) %>% etl::etl_transform() %>%   etl::etl_load()
+
+    rsqr.tbl <- tbl(rsqr.src) 
+    rsqr_data.tbl <- rsqr.tbl %>% select(`doi`,`published_date`) %>% collect()
+    saveRDS(rsqr_data.tbl,file="rsqr_data.tbl.RDS")
+}
+rsqr_data.tbl <- readRDS("rsqr_data.tbl.RDS")
+```
+```{r retrieve-ssrn}
+if (doc_refresh_data) {
+  library("oaind")
+  ssrn.src <-etl.oaind(src="ssrn") 
+  ssrn.src %>%   
+    etl::etl_extract(progress=TRUE) %>% etl::etl_transform() %>%   etl::etl_load()
+
+    ssrn.tbl <- tbl(ssrn.src) 
+    colnames(ssrn.tbl)
+    ssrn_data.tbl <- ssrn.tbl %>% 
+      select(`doi`,`created_date`,`published_year`,`issued_year`,`src_subject`) %>% collect()
+    saveRDS(ssrn_data.tbl,file="ssrn_data.tbl.RDS")
+}
+ssrn_data.tbl <- readRDS("ssrn_data.tbl.RDS")
+```
+```{r}
+preprint.tbl <- bind_rows(
+    ssrn_data.tbl %>% 
+        #slice_head(n=100) %>%
+       hoist(src_subject,subject=1) %>% 
+       mutate(src="SSRN",category=subject,date_pos=lubridate::make_date(year=`issued_year`)) %>%
+       select(src, doi,category,date_pos),
+    bx_data.tbl %>% 
+      #slice_head(n=100) %>%
+      select(doi,category,date) %>% mutate(src="bioArxiv", date_pos=lubridate::as_date(`date`)),
+    mx_data.tbl %>% 
+     #slice_head( n=100) %>%
+      select(doi,category,date) %>% mutate(src="medArxiv",date_pos=lubridate::as_date(`date`)),
+    rsqr_data.tbl %>% 
+       # slice_head(n=100) %>%
+       mutate(src="Research Square",category="",date_pos=lubridate::as_date(`published_date`)) %>%
+      select(src,doi,category,date_pos),
+) %>%
+  mutate(category=factor(str_squish(category))) %>% 
+  mutate(category = fct_recode(category,"None"="")) %>%
+  select(-date)
+```
+
+```{r}
+#rm("bx_data.tbl","mx_data.tbl","rsqr_data.tbl","ssrn_data.tbl")
+library(tsibble)
+retrieval_month<- tsibble::yearmonth("2022 Aug")
+csh_preprint_days.tsbl <- preprint.tbl %>% 
+  count(date_pos,src,category)  %>%
+  rename(submissions=n) %>% 
+  as_tsibble(index=date_pos,
+             key = c("src","category")) %>% 
+  fill_gaps(submissions=0)
+
+axymonth.tsbl <- 
+  ax_monthly_data.tbl %>% 
+  mutate(ymonth = lubridate::parse_date_time(month,order="Ym") %>% 
+           yearmonth(), src="arXiv", category="") %>%
+  select(ymonth,src,submissions,category) %>%
+  as_tsibble(index=ymonth,key=c("src","category") ) %>%
+  fill_gaps(submissions=0) %>%
+  filter(ymonth < yearmonth(retrieval_month)) %>%
+  relocate(ymonth,src,submissions,category)
+
+
+csh_ymonths.tsbl <- 
+  csh_preprint_days.tsbl %>%
+  group_by_key() %>%
+  index_by(ymonth = ~ yearmonth(.)) %>%
+  summarise(
+    submissions = sum(submissions)
+  ) %>%  relocate(ymonth,src,submissions,category)
+
+
+ preprint_ymonths.tsbl <- 
+  bind_rows(csh_ymonths.tsbl,axymonth.tsbl) %>%
+  filter(ymonth < yearmonth(retrieval_month))
+
+```
+
+```{r}
+library(feasts)
+
+
+preprint_ymonths.tsbl %>%
+  ungroup() %>%
+  summarize(submissions = sum(submissions)) %>%
+  autoplot() 
+
+preprint_ymonths.tsbl %>% 
+  filter(src!="SSRN") %>%
+  group_by(src) %>%
+  summarize(submissions = sum(submissions)) %>%
+  autoplot()
+
+preprint_ymonths.tsbl %>% 
+  autoplot() +
+    facet_grid(facets=vars(src),scales="free_y")+
+    theme(legend.position="none") 
+
+preprint_ymonths.tsbl %>%
+  ungroup() %>%
+  filter(src!="SSRN") %>%
+  summarize(submissions = sum(submissions)) %>%
+  model(STL(submissions ~ season(window = Inf))) %>% 
+  components() %>%
+  autoplot()
+```
+
